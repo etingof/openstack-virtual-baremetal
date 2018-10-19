@@ -5,7 +5,7 @@ set -x
 # install python2-crypto from EPEL
 # python-[nova|neutron]client are in a similar situation.  They were renamed
 # in RDO to python2-*
-required_packages="python-pip os-net-config git jq python2-os-client-config"
+required_packages="python-pip os-net-config git jq python2-os-client-config python2-gunicorn"
 
 function have_packages() {
     for i in $required_packages; do
@@ -25,6 +25,10 @@ function have_packages() {
     if ! pip freeze | grep -q pyghmi; then
         return 1
     fi
+# TODO(etingof): switch from git to yum
+#    if ! pip freeze | grep -q sushy-tools; then
+#        return 1
+#    fi
     return 0
 }
 
@@ -35,7 +39,14 @@ if ! have_packages; then
     tripleo-repos current-tripleo
     yum install -y $required_packages python-crypto python2-novaclient python2-neutronclient
     pip install pyghmi
+# TODO(etingof): switch from git to yum
+#    pip install sushy-tools
 fi
+
+# TODO(etingof): switch from git to yum
+# Once the newly discovered bugs in sushy-tools are merged and rpm is released,
+# we should `yum install` instead
+git clone https://github.com/etingof/sushy-tools.git && cd sushy-tools && pip install .
 
 cat <<EOF >/usr/local/bin/openstackbmc
 $openstackbmc_script
@@ -82,6 +93,8 @@ echo "      - default: true" >> /etc/os-net-config/config.yaml
 echo "        next_hop: $default_gw" >> /etc/os-net-config/config.yaml
 echo "    addresses:" >> /etc/os-net-config/config.yaml
 echo "    - ip_netmask: $bmc_utility/$prefix_len" >> /etc/os-net-config/config.yaml
+
+# Configure IPMI BMC
 
 cat <<EOF >/usr/lib/systemd/system/config-bmc-ips.service
 [Unit]
@@ -134,6 +147,8 @@ EOF
     echo "    - ip_netmask: $bmc_ip/$prefix_len" >> /etc/os-net-config/config.yaml
 done
 
+systemctl daemon-reload
+
 # It will be automatically started because the bmc services depend on it,
 # but to avoid confusion also explicitly enable it.
 systemctl enable config-bmc-ips
@@ -147,3 +162,30 @@ do
     systemctl status $unit
 done
 
+# configure Redfish BMC
+
+unit="openstack-redfish-bmc.service"
+
+cat <<EOF >/usr/lib/systemd/system/$unit
+[Unit]
+Description=openstack-redfish-bmc Service
+Requires=config-bmc-ips.service
+After=config-bmc-ips.service
+
+[Service]
+Environment=OS_CLOUD=host_cloud
+ExecStart=/bin/gunicorn sushy_tools.emulator.main:app
+Restart=always
+
+User=root
+StandardOutput=kmsg+console
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+systemctl enable $unit
+systemctl start $unit
